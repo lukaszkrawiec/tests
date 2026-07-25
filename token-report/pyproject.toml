@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenreport"
+version = "0.1.0"
+description = "CI token accounting for agent applications: measure the context your repo commits to sending"
+requires-python = ">=3.11"
+# No runtime dependencies. The Anthropic counter speaks HTTP directly so the tool
+# installs in CI without a dependency resolution step, and so it can be pointed at a
+# local fake in tests.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+tokenreport = "tokenreport.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+filterwarnings = ["error"]

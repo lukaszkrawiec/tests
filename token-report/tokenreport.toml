@@ -1,0 +1,23 @@
+# Token Report measures its own example application, so CI exercises the real path.
+entrypoint = "examples.langgraph_app.tokenreport:collect"
+model = "claude-opus-5"
+
+[budgets]
+# Resident tokens are paid on every request, so they get the tight budget.
+resident_total = 4000
+resident_growth_pct = 15
+
+# On-demand documents are only paid for when retrieved; the ceiling is a sanity bound,
+# not a cost control.
+on_demand_total = 20000
+
+[budgets.component]
+"knowledge.index" = 400
+"agent.researcher.system_prompt" = 1200
+"agent.analyst.system_prompt" = 1200
+
+[history]
+branch = "token-report-data"
+path = "history.json"
+retention_days = 90
+max_entries = 500
