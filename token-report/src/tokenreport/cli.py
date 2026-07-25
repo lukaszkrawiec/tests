@@ -17,14 +17,7 @@ from . import config as config_module
 from . import counters as counters_module
 from .collect import run as collect_run
 from .compare import Severity, compare, evaluate
-from .contract import (
-    ContractError,
-    CountedComponent,
-    CounterInfo,
-    Kind,
-    Report,
-    Tier,
-)
+from .contract import ContractError, Report
 from .github import (
     GitHubClient,
     GitHubError,
@@ -52,7 +45,8 @@ def _load_config(args: argparse.Namespace) -> config_module.Config:
 def _counter(args: argparse.Namespace, config: config_module.Config):
     return counters_module.resolve(
         model=config.model,
-        prefer=args.counter,
+        prefer=args.counter or config.counter,
+        encoding=config.encoding,
         base_url=os.environ.get("ANTHROPIC_BASE_URL"),
     )
 
@@ -99,9 +93,7 @@ def cmd_baseline(args: argparse.Namespace) -> int:
         print(f"no baseline: could not resolve base ref {base_ref!r}", file=sys.stderr)
         return EXIT_OK
 
-    git.fetch(f"{config.history_branch}:refs/remotes/origin/{config.history_branch}")
-    raw = git.show(f"refs/remotes/origin/{config.history_branch}", config.history_path)
-    history = History.loads(raw) if raw else History()
+    _, history = _read_history(git, config)
 
     entry = history.find(merge_base)
     if entry is None:
@@ -118,34 +110,8 @@ def cmd_baseline(args: argparse.Namespace) -> int:
         print("no baseline: history is empty", file=sys.stderr)
         return EXIT_OK
 
-    report = Report(
-        model=entry.model,
-        counter=CounterInfo(name=entry.counter, exact=True),
-        commit=entry.commit,
-        generated_at=entry.timestamp,
-        tool_set_overhead=entry.tool_set_overhead,
-        components=[],
-    )
-    # Rebuild components from the recorded per-component counts. Tiers are inferred from
-    # the head report when available, since history stores counts rather than metadata.
     head = _read_report(Path(args.head)) if args.head else None
-    tiers = {
-        c.id: (c.tier, c.kind, c.group, c.source, c.cache_prefix)
-        for c in (head.components if head else [])
-    }
-
-    rebuilt = []
-    for cid, tokens in entry.components.items():
-        tier, kind, group, source, prefix = tiers.get(
-            cid, (Tier.RESIDENT, Kind.OTHER, None, None, False)
-        )
-        rebuilt.append(
-            CountedComponent(
-                id=cid, tokens=tokens, tier=tier, kind=kind, group=group,
-                source=source, cache_prefix=prefix,
-            )
-        )
-    report.components = rebuilt
+    report = entry.to_report(metadata_from=head)
 
     payload = json.dumps(report.to_json(), indent=2) + "\n"
     if args.output:
@@ -226,36 +192,6 @@ def cmd_record(args: argparse.Namespace) -> int:
     git = Git(root=config.root)
     rendered: dict[str, str] = {}
 
-    if not head.counter.exact:
-        # Refusing to append is right — a trend series must not mix measured and
-        # estimated points. Refusing to *render* is not: the dashboard still shows the
-        # existing history, so a keyless run produces a usable artifact.
-        print(
-            f"not appending to history: counter {head.counter.name!r} is approximate",
-            file=sys.stderr,
-        )
-        if args.output_dir and not args.no_dashboard:
-            existing = None
-            if git.fetch(
-                f"{config.history_branch}:refs/remotes/origin/{config.history_branch}"
-            ):
-                existing = git.show(
-                    f"refs/remotes/origin/{config.history_branch}", config.history_path
-                )
-            history = History.loads(existing) if existing else History()
-            files = {
-                "index.html": render_dashboard(history, head, repo=context.repo),
-                ".nojekyll": "",
-            }
-            if existing:
-                files[config.history_path] = existing
-            _write_dir(Path(args.output_dir), files)
-            print(
-                f"rendered the dashboard from {len(history.entries)} recorded entries",
-                file=sys.stderr,
-            )
-        return EXIT_OK
-
     def build(parent: str | None) -> dict[str, str]:
         existing = git.show(parent, config.history_path) if parent else None
         history, text = build_history_files(
@@ -266,24 +202,13 @@ def cmd_record(args: argparse.Namespace) -> int:
         )
         files = {config.history_path: text}
         if not args.no_dashboard:
-            files["index.html"] = render_dashboard(
-                history, head, repo=context.repo
-            )
-            # A .nojekyll file keeps Pages from ignoring files that start with an
-            # underscore, which is a confusing failure to debug after the fact.
-            files[".nojekyll"] = ""
+            files.update(_dashboard_files(history, head, repo=context.repo))
         rendered.clear()
         rendered.update(files)
         return files
 
     if args.dry_run:
-        build(
-            git.rev_parse(f"refs/remotes/origin/{config.history_branch}")
-            if git.fetch(
-                f"{config.history_branch}:refs/remotes/origin/{config.history_branch}"
-            )
-            else None
-        )
+        build(_history_tip(git, config))
         for path, content in rendered.items():
             print(f"would write {path} ({len(content):,} bytes)", file=sys.stderr)
         if args.output_dir:
@@ -317,6 +242,36 @@ def _write_dir(directory: Path, files: dict[str, str]) -> None:
         target.write_text(content, encoding="utf-8")
 
 
+def _history_ref(config: config_module.Config) -> str:
+    return f"refs/remotes/origin/{config.history_branch}"
+
+
+def _history_tip(git: Git, config: config_module.Config) -> str | None:
+    """Fetch the history branch and return its tip, or None if it does not exist."""
+    if not git.fetch(f"{config.history_branch}:{_history_ref(config)}"):
+        return None
+    return git.rev_parse(_history_ref(config))
+
+
+def _read_history(git: Git, config: config_module.Config) -> tuple[str | None, History]:
+    """Read the recorded history from the data branch."""
+    if _history_tip(git, config) is None:
+        return None, History()
+    raw = git.show(_history_ref(config), config.history_path)
+    return raw, History.loads(raw) if raw else History()
+
+
+def _dashboard_files(
+    history: History, report: Report, *, repo: str | None
+) -> dict[str, str]:
+    return {
+        "index.html": render_dashboard(history, report, repo=repo),
+        # A .nojekyll file keeps Pages from ignoring paths that start with an
+        # underscore, which is a confusing failure to debug after the fact.
+        ".nojekyll": "",
+    }
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
     """Build the dashboard from the recorded history without writing anything back."""
     config = _load_config(args)
@@ -326,15 +281,11 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
     if args.history and Path(args.history).is_file():
         raw = Path(args.history).read_text(encoding="utf-8")
+        history = History.loads(raw)
     else:
-        git.fetch(f"{config.history_branch}:refs/remotes/origin/{config.history_branch}")
-        raw = git.show(f"refs/remotes/origin/{config.history_branch}", config.history_path)
+        raw, history = _read_history(git, config)
 
-    history = History.loads(raw) if raw else History()
-    files = {
-        "index.html": render_dashboard(history, head, repo=context.repo),
-        ".nojekyll": "",
-    }
+    files = _dashboard_files(history, head, repo=context.repo)
     if raw:
         files[config.history_path] = raw
     _write_dir(Path(args.output_dir), files)
@@ -357,9 +308,8 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("-o", "--output", help="write the report JSON here")
     collect.add_argument(
         "--counter",
-        default="auto",
-        choices=["auto", "anthropic", "offline"],
-        help="auto uses the API when a key is present and falls back offline",
+        choices=list(counters_module.COUNTER_NAMES),
+        help="override the counter from config (default: tiktoken)",
     )
     collect.set_defaults(func=cmd_collect)
 

@@ -1,14 +1,19 @@
 """Token counters.
 
-The default counter calls Anthropic's ``/v1/messages/count_tokens``, which is free to
-use (subject to its own requests-per-minute limits, independent of Messages API
-limits). Counts are taken *marginally* against a cached baseline request: counting a
-component in isolation would include fixed per-request overhead, inflating every
-component and making the sum meaningless.
+The default is ``tiktoken``: no API key, no network at measurement time once its
+vocabulary is cached, identical numbers on every machine, and it works on pull requests
+from forks, which receive no repository secrets. Its counts are *not* Claude's — tiktoken
+has no Claude vocabulary — so absolute figures are indicative and the trend is the signal.
 
-An offline approximation exists for one specific reason: pull requests from forks do
-not receive repository secrets, so an API-only counter simply fails for outside
-contributors. Approximate runs are labelled and refused entry into history.
+``anthropic`` is opt-in and is the only counter whose absolute figures match what you are
+billed. It calls ``/v1/messages/count_tokens``, which is free to use, subject to its own
+requests-per-minute limits independent of the Messages API. Its counts are taken
+*marginally* against a cached baseline request: measuring a component in isolation would
+include fixed per-request overhead, inflating every component and making the sum
+meaningless.
+
+Which counter produced a report is recorded alongside it, and comparisons refuse to cross
+a change of counter, because switching re-bases every number.
 """
 
 from __future__ import annotations
@@ -27,6 +32,10 @@ from .contract import CounterInfo
 
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 API_VERSION = "2023-06-01"
+DEFAULT_COUNTER = "tiktoken"
+# Allowance for the framing a provider adds around each tool definition, which costs
+# more than the schema's serialized JSON. Offline counters cannot measure it.
+TOOL_FRAMING_TOKENS = 8
 # A minimal user turn is required for a valid request; its cost is part of the
 # baseline that every marginal count subtracts.
 _PROBE_MESSAGES = [{"role": "user", "content": "."}]
@@ -50,61 +59,108 @@ class Counter(Protocol):
         """Optionally pre-populate a cache. Implementations may ignore this."""
 
 
-class OfflineCounter:
-    """Dependency-free approximation, or tiktoken when it happens to be installed.
+class _OfflineBase:
+    """Shared shape for counters that measure text locally. Subclasses set both."""
 
-    This is deliberately not presented as accurate. Claude's tokenizer is not
-    available offline, and Claude 4.7 and later tokenize roughly 30% higher than
-    earlier models for the same text, so no offline vocabulary tracks it. Useful for
-    relative signal on fork PRs; never written to history.
-    """
-
-    #  Approximates a BPE pretokenizer: words with leading space, numbers in short
-    #  runs, punctuation, and whitespace runs are all separate chunks.
-    _PRETOKEN = re.compile(r"\s*[A-Za-z]+|\s*\d{1,3}|\s*[^\sA-Za-z\d]+|\s+")
-    _CHARS_PER_TOKEN = 4.2
-
-    def __init__(self, *, model: str | None = None) -> None:
-        self._encoding = None
-        self._detail = "heuristic pretokenizer; approximate"
-        try:  # pragma: no cover - depends on optional install
-            import tiktoken
-
-            self._encoding = tiktoken.get_encoding("o200k_base")
-            self._detail = "tiktoken o200k_base; approximate for Claude"
-        except Exception:  # noqa: BLE001 - any failure means fall back to heuristic
-            pass
-        self._model = model
+    name: str
+    detail: str
 
     @property
     def info(self) -> CounterInfo:
-        return CounterInfo(name="offline", exact=False, detail=self._detail)
+        return CounterInfo(name=self.name, exact=False, detail=self.detail)
+
+    def count_text(self, text: str) -> int:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def count_tools(self, tools: Sequence[Mapping[str, Any]]) -> int:
+        # A tool definition costs more than its serialized JSON: names, descriptions
+        # and schema keys are re-rendered into a structured form. The per-tool constant
+        # is a rough allowance for that framing.
+        serialized = json.dumps(list(tools), sort_keys=True)
+        return self.count_text(serialized) + TOOL_FRAMING_TOKENS * len(tools)
+
+    def warm(self, texts: Iterable[str]) -> None:
+        return None
+
+
+class TiktokenCounter(_OfflineBase):
+    """Counts with a tiktoken encoding — the default counter.
+
+    ``exact`` is False, and that word is doing precise work: these counts are not
+    Claude's. tiktoken has no Claude vocabulary, and Claude 4.7 and later tokenize
+    roughly 30% higher than earlier models for identical text, so treat absolute
+    figures as indicative and the trend as the signal.
+
+    What it *is* is deterministic and reproducible: the same text yields the same count
+    on every machine, forever, with no key and no network at measurement time. That is
+    what makes it usable as a tracked series, which is a different property from being
+    numerically right.
+    """
+
+    DEFAULT_ENCODING = "o200k_base"
+
+    def __init__(self, *, encoding: str | None = None, model: str | None = None) -> None:
+        requested = encoding or self.DEFAULT_ENCODING
+        try:
+            import tiktoken
+        except ImportError as exc:  # pragma: no cover - dependency is declared
+            raise CounterError(
+                "the tiktoken counter needs the tiktoken package; install "
+                "tokenreport with its default dependencies, or select the "
+                "'heuristic' counter"
+            ) from exc
+        try:
+            # Downloads and caches the vocabulary on first use. Set TIKTOKEN_CACHE_DIR
+            # in CI to keep that off the critical path of every run.
+            self._encoding = tiktoken.get_encoding(requested)
+        except Exception as exc:  # noqa: BLE001 - unknown name or fetch failure
+            raise CounterError(
+                f"could not load tiktoken encoding {requested!r}: {exc}"
+            ) from exc
+        self.name = "tiktoken"
+        self.encoding_name = requested
+        self.detail = f"tiktoken {requested}; not Claude's tokenizer"
+        self._model = model
 
     def count_text(self, text: str) -> int:
         if not text:
             return 0
-        if self._encoding is not None:  # pragma: no cover - optional install
-            return len(self._encoding.encode(text, disallowed_special=()))
-        total = 0
-        for chunk in self._PRETOKEN.findall(text):
-            stripped = chunk.strip()
-            if not stripped:
-                # Whitespace runs mostly merge into adjacent tokens; a long run of
-                # indentation still costs something.
-                total += max(0, (len(chunk) - 1) // 4)
-                continue
-            total += max(1, math.ceil(len(chunk) / self._CHARS_PER_TOKEN))
-        return total
+        # Special tokens are data here, not control sequences: a prompt that happens to
+        # contain one must be counted, not rejected.
+        return len(self._encoding.encode(text, disallowed_special=()))
 
-    def count_tools(self, tools: Sequence[Mapping[str, Any]]) -> int:
-        # A tool definition costs more than its serialized JSON: names, descriptions
-        # and schema keys are re-rendered into a structured form. The per-tool
-        # constant is a rough allowance for that framing.
-        serialized = json.dumps(list(tools), sort_keys=True)
-        return self.count_text(serialized) + 8 * len(tools)
 
-    def warm(self, texts: Iterable[str]) -> None:
-        return None
+class HeuristicCounter(_OfflineBase):
+    """Pure-Python estimate, for when tiktoken cannot be installed or reached.
+
+    Less accurate than tiktoken and it says so. Present because tiktoken fetches its
+    vocabulary over the network on first use, and an air-gapped runner would otherwise
+    have no counter at all.
+    """
+
+    #  Approximates a BPE pretokenizer: a word, a short run of digits, or a run of
+    #  punctuation, each carrying any whitespace that precedes it. Every alternative
+    #  requires at least one non-space character, so whitespace never forms a chunk of
+    #  its own — it is absorbed into the chunk that follows, as a real BPE does.
+    _PRETOKEN = re.compile(r"\s*[A-Za-z]+|\s*\d{1,3}|\s*[^\sA-Za-z\d]+")
+    #  Calibrated against tiktoken o200k_base over this repository's prompts, markdown
+    #  and source: mean ratio 1.00, and 0.96–1.01 on prose, which is what prompts are.
+    #  Most chunks fall under the divisor and cost the floor of one token, which is why
+    #  the constant is much larger than the familiar "four characters per token".
+    _CHARS_PER_TOKEN = 10.0
+
+    def __init__(self, *, model: str | None = None) -> None:
+        self.name = "heuristic"
+        self.detail = "pure-python estimate; least accurate counter"
+        self._model = model
+
+    def count_text(self, text: str) -> int:
+        if not text:
+            return 0
+        return sum(
+            max(1, math.ceil(len(chunk) / self._CHARS_PER_TOKEN))
+            for chunk in self._PRETOKEN.findall(text)
+        )
 
 
 class LengthCounter:
@@ -266,29 +322,56 @@ class AnthropicCounter:
             list(pool.map(self.count_text, pending))
 
 
+COUNTER_NAMES = ("tiktoken", "heuristic", "anthropic")
+# Only the provider's own endpoint reports the tokenization it will actually bill.
+EXACT_COUNTERS = frozenset({"anthropic"})
+
+
+def counter_is_exact(name: str) -> bool:
+    """Whether counts from ``name`` match what the provider charges.
+
+    History records the counter's name rather than this flag, so it is derived in one
+    place instead of being stored — and cannot drift out of step with the counters.
+    """
+    return name in EXACT_COUNTERS
+
+
 def resolve(
     *,
     model: str,
-    prefer: str = "auto",
+    prefer: str = DEFAULT_COUNTER,
+    encoding: str | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
 ) -> Counter:
-    """Pick a counter.
+    """Pick a counter by name.
 
-    ``auto`` uses the API when a key is available and falls back to the offline
-    approximation otherwise, which is what keeps fork pull requests working.
+    tiktoken is the default: no key, no per-run network dependency, identical numbers on
+    every machine, and it works on fork pull requests, which receive no secrets. The
+    Anthropic counter is opt-in for when exact Claude counts are wanted; it is the only
+    one whose absolute figures match what you are billed.
+
+    There is deliberately no "auto" mode. Silently switching counters based on whether a
+    key happens to be present would change what the numbers mean between runs, and a
+    trend whose tokenizer varies invisibly is worse than no trend.
     """
-    key = api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", "")
-    if prefer == "offline":
-        return OfflineCounter(model=model)
+    if prefer == "tiktoken":
+        try:
+            return TiktokenCounter(encoding=encoding, model=model)
+        except CounterError:
+            # An air-gapped runner cannot fetch the vocabulary. Degrade rather than
+            # fail, and let the report name the counter that actually ran.
+            return HeuristicCounter(model=model)
+    if prefer == "heuristic":
+        return HeuristicCounter(model=model)
     if prefer == "anthropic":
+        key = api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", "")
         if not key:
             raise CounterError(
-                "counter 'anthropic' requested but ANTHROPIC_API_KEY is not set"
+                "counter 'anthropic' requested but ANTHROPIC_API_KEY is not set; "
+                "set the secret or use the default 'tiktoken' counter"
             )
         return AnthropicCounter(model=model, api_key=key, base_url=base_url)
-    if prefer != "auto":
-        raise CounterError(f"unknown counter {prefer!r} (expected auto/anthropic/offline)")
-    if key:
-        return AnthropicCounter(model=model, api_key=key, base_url=base_url)
-    return OfflineCounter(model=model)
+    raise CounterError(
+        f"unknown counter {prefer!r} (expected one of {', '.join(COUNTER_NAMES)})"
+    )

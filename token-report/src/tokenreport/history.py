@@ -3,8 +3,9 @@
 History lives as JSON on an orphan branch, so it is auditable in git and needs no
 external service. Two properties matter more than they look:
 
-* Only exact counts are recorded. An approximate run would put a step change in the
-  series that reflects the counter, not the prompts.
+* Every entry stamps the model and counter that produced it. Any counter may be
+  recorded — what a series cannot survive is a tokenizer change going unnoticed, so
+  comparisons refuse to cross one and the dashboard breaks its line there.
 * Entries are keyed by commit. Re-running a workflow on the same commit replaces its
   entry rather than adding a duplicate point.
 """
@@ -14,9 +15,10 @@ from __future__ import annotations
 import datetime as _dt
 import json
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
-from .contract import Report, Tier
+from .contract import CountedComponent, CounterInfo, Kind, Report, Tier
+from .counters import counter_is_exact
 
 SCHEMA_VERSION = 1
 
@@ -36,6 +38,11 @@ class HistoryEntry:
     cache_prefix: int = 0
     tool_set_overhead: int = 0
     components: Mapping[str, int] = field(default_factory=dict)
+    #  Tier per component, recorded only where it differs from the resident default so
+    #  the file stays compact. Without this, a component that a later commit removes
+    #  entirely cannot be tiered when rebuilding the baseline, and an on-demand document
+    #  would be counted as resident — reporting a large resident drop that never happened.
+    tiers: Mapping[str, str] = field(default_factory=dict)
     ref: str | None = None
 
     @property
@@ -48,12 +55,11 @@ class HistoryEntry:
 
     @classmethod
     def from_report(cls, report: Report) -> "HistoryEntry":
-        if not report.counter.exact:
-            raise HistoryError(
-                f"refusing to record an approximate run (counter "
-                f"{report.counter.name!r}): a trend series must not mix measured and "
-                f"estimated points"
-            )
+        # Any counter may be recorded. What a series cannot survive is a counter
+        # *change* going unnoticed, so every entry stamps the tokenizer that produced
+        # it and comparisons refuse to cross a change. Gating on exactness instead
+        # would mean a repository using tiktoken — the default — never records a single
+        # point and its dashboard stays permanently empty.
         if not report.commit:
             raise HistoryError("cannot record a report with no commit sha")
         return cls(
@@ -67,7 +73,54 @@ class HistoryEntry:
             cache_prefix=report.cache_prefix_tokens,
             tool_set_overhead=report.tool_set_overhead,
             components={c.id: c.tokens for c in report.components},
+            tiers={
+                c.id: c.tier.value
+                for c in report.components
+                if c.tier is not Tier.RESIDENT
+            },
             ref=report.ref,
+        )
+
+    def to_report(self, *, metadata_from: "Report | None" = None) -> "Report":
+        """Rebuild a Report from this entry, for use as a comparison baseline.
+
+        History stores per-component counts, not their metadata, so tier and grouping are
+        recovered from a current report when one is available. Recovering the tier
+        matters: defaulting an on-demand knowledge document to resident would attribute
+        its size to the total paid on every request and report growth in the wrong tier.
+        """
+        known = {
+            c.id: (c.tier, c.kind, c.group, c.source, c.cache_prefix)
+            for c in (metadata_from.components if metadata_from else [])
+        }
+        components = []
+        for cid, tokens in self.components.items():
+            if cid in known:
+                tier, kind, group, source, prefix = known[cid]
+            else:
+                # Not in the current report — typically because this commit removes it.
+                # The recorded tier is the only thing that can classify it correctly.
+                tier = Tier.parse(self.tiers.get(cid, Tier.RESIDENT.value))
+                kind, group, source, prefix = Kind.OTHER, None, None, False
+            components.append(
+                CountedComponent(
+                    id=cid,
+                    tokens=tokens,
+                    tier=tier,
+                    kind=kind,
+                    group=group,
+                    source=source,
+                    cache_prefix=prefix,
+                )
+            )
+        return Report(
+            model=self.model,
+            counter=CounterInfo(name=self.counter, exact=counter_is_exact(self.counter)),
+            commit=self.commit,
+            ref=self.ref,
+            generated_at=self.timestamp,
+            tool_set_overhead=self.tool_set_overhead,
+            components=components,
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -84,6 +137,8 @@ class HistoryEntry:
             },
             "components": dict(self.components),
         }
+        if self.tiers:
+            out["tiers"] = dict(self.tiers)
         if self.ref:
             out["ref"] = self.ref
         return out
@@ -101,6 +156,7 @@ class HistoryEntry:
             cache_prefix=int(totals.get("cache_prefix", 0)),
             tool_set_overhead=int(totals.get("tool_set_overhead", 0)),
             components=dict(raw.get("components", {})),
+            tiers=dict(raw.get("tiers", {})),
             ref=raw.get("ref"),
         )
 
@@ -155,19 +211,21 @@ class History:
         kept = [e for e in self.entries if e.commit != entry.commit]
         return History(entries=[*kept, entry], schema_version=self.schema_version)
 
-    def model_changes(self) -> list[str]:
-        """Commits at which the model, and therefore the tokenizer, changed.
+    def tokenizer_changes(self) -> list[str]:
+        """Commits at which the tokenizer changed — a different model or counter.
 
-        The dashboard breaks its line at these points: Claude 4.7 and later tokenize
-        roughly 30% higher for the same text, so connecting across a change would draw
-        a model upgrade as a sudden regression.
+        The dashboard breaks its line at these points. Two distinct causes, same
+        consequence: Claude 4.7 and later tokenize roughly 30% higher for identical
+        text, and switching counter (tiktoken to the Anthropic API, say) re-bases every
+        number. Connecting across either would draw a measurement change as growth.
         """
         changes: list[str] = []
-        previous: str | None = None
+        previous: tuple[str, str] | None = None
         for entry in self.sorted_entries():
-            if previous is not None and entry.model != previous:
+            current = (entry.model, entry.counter)
+            if previous is not None and current != previous:
                 changes.append(entry.commit)
-            previous = entry.model
+            previous = current
         return changes
 
     def prune(
@@ -207,29 +265,6 @@ class History:
         return History(entries=kept, schema_version=self.schema_version)
 
 
-def component_series(history: History) -> dict[str, list[int | None]]:
-    """Per-component token counts aligned to the sorted entry list.
-
-    A component missing from an entry yields None rather than 0, so a chart shows a gap
-    where a component did not exist instead of implying it dropped to zero.
-    """
-    entries = history.sorted_entries()
-    ids: list[str] = []
-    seen: set[str] = set()
-    for entry in entries:
-        for cid in entry.components:
-            if cid not in seen:
-                seen.add(cid)
-                ids.append(cid)
-    return {
-        cid: [entry.components.get(cid) for entry in entries] for cid in sorted(ids)
-    }
-
-
-def resident_component_ids(report: Report) -> list[str]:
-    return [c.id for c in report.components if c.tier is Tier.RESIDENT]
-
-
 def build_history_files(
     *,
     existing: str | None,
@@ -244,7 +279,3 @@ def build_history_files(
         retention_days=retention_days, max_entries=max_entries, now=now
     )
     return updated, updated.dumps()
-
-
-def iter_entries(history: History) -> Iterable[HistoryEntry]:
-    return history.sorted_entries()

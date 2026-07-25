@@ -14,7 +14,7 @@ from tokenreport.render.markdown import (
 def report(components, *, model="claude-opus-5", exact=True, overhead=0, commit="a" * 40):
     return Report(
         model=model,
-        counter=CounterInfo(name="anthropic" if exact else "offline", exact=exact),
+        counter=CounterInfo(name="anthropic" if exact else "tiktoken", exact=exact),
         commit=commit,
         tool_set_overhead=overhead,
         components=[
@@ -107,10 +107,13 @@ class TestCommentWarnings:
     def test_first_run_says_it_establishes_a_baseline(self):
         assert "establishes one" in rendered(report({"a": 10}))
 
-    def test_approximate_counts_are_flagged_prominently(self):
+    def test_an_inexact_counter_is_named_and_its_limits_stated(self):
+        # It no longer says "not recorded" — inexact counters are recorded now — but the
+        # reader still needs to know the absolute figures are not Claude's.
         body = rendered(report({"a": 10}, exact=False))
-        assert "approximate" in body
-        assert "not recorded in history" in body
+        assert "not\nClaude's tokenizer" in body or "not Claude's tokenizer" in body
+        assert "delta" in body
+        assert "not recorded in history" not in body
 
     def test_tokenizer_change_explains_the_missing_delta(self):
         body = rendered(report({"a": 130}, model="claude-fable-5"), report({"a": 100}))

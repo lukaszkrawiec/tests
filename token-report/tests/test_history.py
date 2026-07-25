@@ -8,7 +8,6 @@ from tokenreport.history import (
     HistoryEntry,
     HistoryError,
     build_history_files,
-    component_series,
 )
 
 NOW = dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc)
@@ -22,7 +21,7 @@ def report(components, *, commit="abc123", exact=True, model="claude-opus-5",
            generated_at=None):
     return Report(
         model=model,
-        counter=CounterInfo(name="anthropic" if exact else "offline", exact=exact),
+        counter=CounterInfo(name="anthropic" if exact else "tiktoken", exact=exact),
         commit=commit,
         generated_at=generated_at or stamp(0),
         components=[
@@ -37,12 +36,13 @@ def report(components, *, commit="abc123", exact=True, model="claude-opus-5",
     )
 
 
-def entry(commit, days_ago, *, resident=100, model="claude-opus-5", components=None):
+def entry(commit, days_ago, *, resident=100, model="claude-opus-5", components=None,
+          counter="anthropic"):
     return HistoryEntry(
         commit=commit,
         timestamp=stamp(days_ago),
         model=model,
-        counter="anthropic",
+        counter=counter,
         resident=resident,
         on_demand=0,
         components=components or {},
@@ -56,11 +56,11 @@ class TestEntryFromReport:
         assert result.on_demand == 90
         assert result.components == {"a": 10, "doc.b": 90}
 
-    def test_refuses_an_approximate_run(self):
-        # An estimated point would put a step change in the series that reflects the
-        # counter rather than the prompts.
-        with pytest.raises(HistoryError, match="refusing to record an approximate run"):
-            HistoryEntry.from_report(report({"a": 10}, exact=False))
+    def test_records_an_approximate_counter_and_stamps_its_name(self):
+        # tiktoken is the default counter and is not exact. Gating on exactness would
+        # mean the trend never records a point and the dashboard stays empty forever.
+        result = HistoryEntry.from_report(report({"a": 10}, exact=False))
+        assert result.counter == "tiktoken"
 
     def test_refuses_a_report_with_no_commit(self):
         with pytest.raises(HistoryError, match="no commit sha"):
@@ -108,7 +108,7 @@ class TestAppend:
         assert len(history.entries) == 1
 
 
-class TestModelChanges:
+class TestTokenizerChanges:
     def test_detects_a_tokenizer_change(self):
         history = History(
             entries=[
@@ -117,10 +117,22 @@ class TestModelChanges:
                 entry("c", 1, model="claude-fable-5"),
             ]
         )
-        assert history.model_changes() == ["c"]
+        assert history.tokenizer_changes() == ["c"]
 
     def test_no_change_when_the_model_is_stable(self):
-        assert History(entries=[entry("a", 2), entry("b", 1)]).model_changes() == []
+        assert History(entries=[entry("a", 2), entry("b", 1)]).tokenizer_changes() == []
+
+    def test_detects_a_counter_change_at_a_stable_model(self):
+        # Switching from tiktoken to the API re-bases every number just as a model
+        # change does, so it breaks the series the same way.
+        history = History(
+            entries=[
+                entry("a", 3, counter="tiktoken"),
+                entry("b", 2, counter="tiktoken"),
+                entry("c", 1, counter="anthropic"),
+            ]
+        )
+        assert history.tokenizer_changes() == ["c"]
 
     def test_detects_multiple_changes_including_a_revert(self):
         history = History(
@@ -130,7 +142,7 @@ class TestModelChanges:
                 entry("c", 2, model="m1"),
             ]
         )
-        assert history.model_changes() == ["b", "c"]
+        assert history.tokenizer_changes() == ["b", "c"]
 
 
 class TestPrune:
@@ -172,34 +184,76 @@ class TestPrune:
         assert [e.commit for e in result.sorted_entries()] == ["a", "b", "c"]
 
 
-class TestComponentSeries:
-    def test_aligns_counts_to_entries(self):
-        history = History(
-            entries=[
-                entry("a", 2, components={"x": 10, "y": 5}),
-                entry("b", 1, components={"x": 12, "y": 6}),
-            ]
-        )
-        assert component_series(history) == {"x": [10, 12], "y": [5, 6]}
+class TestRebuildingAReport:
+    """to_report() supplies the baseline every pull request is compared against."""
 
-    def test_missing_component_is_a_gap_not_a_zero(self):
-        # A component that did not exist yet must not render as having dropped to zero.
-        history = History(
-            entries=[
-                entry("a", 2, components={"x": 10}),
-                entry("b", 1, components={"x": 12, "new": 3}),
-            ]
+    def base(self):
+        return Report(
+            model="claude-opus-5",
+            counter=CounterInfo(name="tiktoken", exact=False),
+            commit="basecommit",
+            generated_at=stamp(1),
+            components=[
+                CountedComponent(id="agent.p", tokens=100, tier=Tier.RESIDENT,
+                                 kind=Kind.OTHER),
+                CountedComponent(id="kb.doc", tokens=500, tier=Tier.ON_DEMAND,
+                                 kind=Kind.OTHER),
+            ],
         )
-        assert component_series(history)["new"] == [None, 3]
 
-    def test_removed_component_leaves_a_trailing_gap(self):
-        history = History(
-            entries=[
-                entry("a", 2, components={"x": 10, "gone": 4}),
-                entry("b", 1, components={"x": 12}),
-            ]
+    def test_round_trips_the_totals_of_the_report_it_came_from(self):
+        original = self.base()
+        rebuilt = HistoryEntry.from_report(original).to_report(metadata_from=original)
+        assert rebuilt.resident == original.resident
+        assert rebuilt.on_demand == original.on_demand
+
+    def test_a_component_removed_by_this_commit_keeps_its_recorded_tier(self):
+        # The bug this guards: with the component gone from the head report, defaulting
+        # it to resident made a deleted on-demand document look like a 500-token drop in
+        # the total paid on every request.
+        entry = HistoryEntry.from_report(self.base())
+        head = Report(
+            model="claude-opus-5",
+            counter=CounterInfo(name="tiktoken", exact=False),
+            commit="headcommit",
+            components=[
+                CountedComponent(id="agent.p", tokens=100, tier=Tier.RESIDENT,
+                                 kind=Kind.OTHER)
+            ],
         )
-        assert component_series(history)["gone"] == [4, None]
+        rebuilt = entry.to_report(metadata_from=head)
+        assert rebuilt.resident == 100
+        assert rebuilt.on_demand == 500
+
+    def test_only_non_resident_tiers_are_stored(self):
+        # Resident is the default, so recording it for every component would bloat the
+        # file for no information.
+        assert HistoryEntry.from_report(self.base()).tiers == {"kb.doc": "on_demand"}
+
+    def test_tiers_survive_a_serialization_round_trip(self):
+        entry = HistoryEntry.from_report(self.base())
+        restored = History.loads(History(entries=[entry]).dumps()).entries[0]
+        assert restored.to_report().on_demand == 500
+
+    def test_the_current_report_wins_when_a_component_changed_tier(self):
+        # Promoting a document from on-demand to resident is a real change the current
+        # report is authoritative about.
+        entry = HistoryEntry.from_report(self.base())
+        head = Report(
+            model="claude-opus-5",
+            counter=CounterInfo(name="tiktoken", exact=False),
+            commit="headcommit",
+            components=[
+                CountedComponent(id="kb.doc", tokens=500, tier=Tier.RESIDENT,
+                                 kind=Kind.OTHER)
+            ],
+        )
+        assert entry.to_report(metadata_from=head).resident == 600
+
+    def test_the_counter_is_reported_honestly_rather_than_assumed_exact(self):
+        rebuilt = HistoryEntry.from_report(self.base()).to_report()
+        assert rebuilt.counter.name == "tiktoken"
+        assert rebuilt.counter.exact is False
 
 
 class TestBuildHistoryFiles:
@@ -225,12 +279,12 @@ class TestBuildHistoryFiles:
         )
         assert len(history.entries) == 1
 
-    def test_approximate_report_is_refused_before_any_write(self):
-        with pytest.raises(HistoryError):
-            build_history_files(
-                existing=None,
-                report=report({"a": 1}, exact=False),
-                retention_days=90,
-                max_entries=500,
-                now=NOW,
-            )
+    def test_an_approximate_report_is_recorded_like_any_other(self):
+        history, _ = build_history_files(
+            existing=None,
+            report=report({"a": 1}, exact=False),
+            retention_days=90,
+            max_entries=500,
+            now=NOW,
+        )
+        assert history.entries[0].counter == "tiktoken"

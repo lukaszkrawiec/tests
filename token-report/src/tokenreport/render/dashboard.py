@@ -19,15 +19,23 @@ from dataclasses import dataclass
 from ..contract import Report, Tier
 from ..history import History, HistoryEntry
 
-# The documented categorical order, first slots only. Both modes validated: worst
-# adjacent CVD ΔE 9.1 light / 8.4 dark, worst adjacent normal-vision ΔE 19.6 / 19.3.
-# Three light steps sit below 3:1 on the light surface, so the relief rule applies —
-# the table view below the charts is that relief.
+# The documented categorical order, in slot order. Both modes validated: worst adjacent
+# CVD ΔE 9.1 light / 8.4 dark, worst adjacent normal-vision ΔE 19.6 / 19.3. Three light
+# steps sit below 3:1 on the light surface, so the relief rule applies — the table view
+# below the charts is that relief.
+#
+# These are the only place the palette is written down; the CSS custom properties are
+# generated from them, so a slot cannot say one colour in the stylesheet and another in
+# the legend.
 _SERIES_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300",
                  "#4a3aa7", "#e34948"]
 _SERIES_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300",
                 "#9085e9", "#e66767"]
 MAX_SERIES = len(_SERIES_LIGHT)
+
+
+def _series_vars(palette: list[str]) -> str:
+    return " ".join(f"--s{i}:{hex_};" for i, hex_ in enumerate(palette))
 
 _PLOT = {"width": 960, "height": 300, "left": 64, "right": 16, "top": 16, "bottom": 44}
 
@@ -308,8 +316,7 @@ _STYLE = """
   --text-primary: #0b0b0b; --text-secondary: #52514e; --muted: #898781;
   --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
   --good: #0ca30c; --critical: #d03b3b; --up: #d03b3b; --down: #006300;
-  --s0:#2a78d6; --s1:#eb6834; --s2:#1baf7a; --s3:#eda100;
-  --s4:#e87ba4; --s5:#008300; --s6:#4a3aa7; --s7:#e34948;
+  /*SERIES-LIGHT*/
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
@@ -318,8 +325,7 @@ _STYLE = """
     --text-primary: #ffffff; --text-secondary: #c3c2b7; --muted: #898781;
     --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
     --good: #0ca30c; --critical: #d03b3b; --up: #e66767; --down: #0ca30c;
-    --s0:#3987e5; --s1:#d95926; --s2:#199e70; --s3:#c98500;
-    --s4:#d55181; --s5:#008300; --s6:#9085e9; --s7:#e66767;
+    /*SERIES-DARK*/
     color-scheme: dark;
   }
 }
@@ -328,8 +334,7 @@ _STYLE = """
   --text-primary: #ffffff; --text-secondary: #c3c2b7; --muted: #898781;
   --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
   --good: #0ca30c; --critical: #d03b3b; --up: #e66767; --down: #0ca30c;
-  --s0:#3987e5; --s1:#d95926; --s2:#199e70; --s3:#c98500;
-  --s4:#d55181; --s5:#008300; --s6:#9085e9; --s7:#e66767;
+  /*SERIES-DARK*/
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
@@ -370,9 +375,7 @@ h2 { font-size: 1.05rem; margin: 0 0 .2rem; }
 .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .pt { fill: transparent; stroke: none; }
 .pt.solo { fill: currentColor; }
-.s0 { color: var(--s0); } .s1 { color: var(--s1); } .s2 { color: var(--s2); }
-.s3 { color: var(--s3); } .s4 { color: var(--s4); } .s5 { color: var(--s5); }
-.s6 { color: var(--s6); } .s7 { color: var(--s7); }
+/*SERIES-SLOTS*/
 polygon.band, rect.band { fill: currentColor; }
 polyline.line { stroke: currentColor; }
 .legend { display: flex; flex-wrap: wrap; gap: .25rem 1.1rem; margin: .9rem 0 0; padding: 0; list-style: none; font-size: .85rem; }
@@ -430,11 +433,8 @@ def render_dashboard(
             for cid, group in grouping.items()
         }
 
-    breaks = {
-        index
-        for index, entry in enumerate(entries)
-        if entry.commit in set(history.model_changes())
-    }
+    changed_at = set(history.tokenizer_changes())
+    breaks = {i for i, entry in enumerate(entries) if entry.commit in changed_at}
 
     stamp = (generated_at or _dt.datetime.now(_dt.timezone.utc)).strftime(
         "%d %b %Y %H:%M UTC"
@@ -527,9 +527,19 @@ def render_dashboard(
         '<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
         f"<title>{_esc(title)}</title>\n"
-        f"<style>{_STYLE}</style>\n</head>\n<body>\n"
+        f"<style>{_style()}</style>\n</head>\n<body>\n"
         + "\n".join(body)
         + "\n</body>\n</html>\n"
+    )
+
+
+def _style() -> str:
+    """Fill the stylesheet's palette placeholders from the slot lists."""
+    slots = "\n".join(f".s{i} {{ color: var(--s{i}); }}" for i in range(MAX_SERIES))
+    return (
+        _STYLE.replace("/*SERIES-LIGHT*/", _series_vars(_SERIES_LIGHT))
+        .replace("/*SERIES-DARK*/", _series_vars(_SERIES_DARK))
+        .replace("/*SERIES-SLOTS*/", slots)
     )
 
 

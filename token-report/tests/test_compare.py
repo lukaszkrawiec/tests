@@ -100,17 +100,24 @@ class TestComparability:
         assert result.resident_pct is None
 
     def test_a_different_counter_makes_the_comparison_invalid(self):
-        result = compare(report({"a": 10}), report({"a": 10}, counter="offline",
-                                                   exact=False))
-        assert result.comparable is False
-        assert "offline" in result.incomparable_reason
-
-    def test_an_approximate_head_makes_the_comparison_invalid(self):
+        # Switching counter re-bases every number, exactly as a model change does.
         result = compare(
-            report({"a": 10}, counter="anthropic", exact=False), report({"a": 10})
+            report({"a": 10}), report({"a": 10}, counter="tiktoken", exact=False)
         )
         assert result.comparable is False
-        assert "approximate" in result.incomparable_reason
+        assert "tiktoken" in result.incomparable_reason
+        assert "re-bases" in result.incomparable_reason
+
+    def test_the_same_approximate_counter_on_both_sides_still_compares(self):
+        # tiktoken is the default and is not exact, but a delta between two tiktoken
+        # measurements is perfectly meaningful — comparability is about identity, not
+        # absolute accuracy. Gating on exactness would disable deltas entirely.
+        result = compare(
+            report({"a": 130}, counter="tiktoken", exact=False),
+            report({"a": 100}, counter="tiktoken", exact=False),
+        )
+        assert result.comparable is True
+        assert result.resident_pct == pytest.approx(30.0)
 
     def test_component_deltas_are_still_computed_for_display(self):
         # The numbers are shown with a warning rather than withheld entirely.

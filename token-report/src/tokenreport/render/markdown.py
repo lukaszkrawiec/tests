@@ -172,8 +172,9 @@ def _footer(comparison: Comparison) -> list[str]:
     if not head.counter.exact:
         lines.insert(
             1,
-            "> ⚠️ Counts are **approximate** — measured without an API key, so this run "
-            "is not recorded in history. Fork pull requests do not receive secrets.",
+            f"> ℹ️ Counted with `{head.counter.name}`, which is reproducible but is not "
+            f"Claude's tokenizer — treat the **delta** as the signal and absolute "
+            f"figures as indicative. Set the counter to `anthropic` for exact counts.",
         )
     if comparison.base is not None and not comparison.comparable:
         lines.insert(

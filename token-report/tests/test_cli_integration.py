@@ -137,7 +137,7 @@ def run_cli(args: list[str], *, cwd: Path, env: dict[str, str] | None = None) ->
 
 def collect(work: Path, output: str = "head.json") -> dict:
     assert run_cli(
-        ["collect", "--counter", "offline", "-o", output], cwd=work
+        ["collect", "--counter", "heuristic", "-o", output], cwd=work
     ) == EXIT_OK
     return json.loads((work / output).read_text())
 
@@ -159,41 +159,37 @@ class TestCollect:
         report = collect(work)
         assert report["commit"] == git("rev-parse", "HEAD", cwd=work)
 
-    def test_offline_counter_is_marked_inexact(self, project):
+    def test_the_counter_is_named_and_marked_inexact(self, project):
         work, _ = project
-        assert collect(work)["counter"]["exact"] is False
+        report = collect(work)
+        assert report["counter"]["exact"] is False
+        # The specific counter is stamped, because comparisons key on its identity.
+        assert report["counter"]["name"] == "heuristic"
 
     def test_a_broken_collector_exits_with_an_error_not_a_traceback(self, project):
         work, _ = project
         (work / "app.py").write_text("def collect():\n    raise RuntimeError('boom')\n")
-        assert run_cli(["collect", "--counter", "offline"], cwd=work) == EXIT_ERROR
+        assert run_cli(["collect", "--counter", "heuristic"], cwd=work) == EXIT_ERROR
 
     def test_a_mis_tiered_component_is_rejected(self, project):
         work, _ = project
         (work / "app.py").write_text(
             'def collect():\n    yield {"id": "a", "tier": "sometimes", "text": "x"}\n'
         )
-        assert run_cli(["collect", "--counter", "offline"], cwd=work) == EXIT_ERROR
+        assert run_cli(["collect", "--counter", "heuristic"], cwd=work) == EXIT_ERROR
 
 
 class TestRecordAndBaseline:
-    def exact_report(self, work: Path, name="head.json") -> dict:
-        """Collect, then relabel as exact so it is eligible for history."""
-        report = collect(work, name)
-        report["counter"] = {"name": "anthropic", "exact": True}
-        (work / name).write_text(json.dumps(report))
-        return report
-
     def test_record_pushes_history_and_a_dashboard(self, project):
         work, remote = project
-        self.exact_report(work)
+        collect(work)
         assert run_cli(["record", "--head", "head.json"], cwd=work) == EXIT_OK
         files = git("ls-tree", "--name-only", "token-report-data", cwd=remote).split()
         assert sorted(files) == [".nojekyll", "history.json", "index.html"]
 
     def test_recorded_history_contains_the_commit(self, project):
         work, remote = project
-        report = self.exact_report(work)
+        report = collect(work)
         run_cli(["record", "--head", "head.json"], cwd=work)
         history = History.loads(
             git("show", "token-report-data:history.json", cwd=remote)
@@ -201,19 +197,20 @@ class TestRecordAndBaseline:
         assert history.entries[0].commit == report["commit"]
         assert history.entries[0].resident == report["totals"]["resident"]
 
-    def test_an_approximate_report_is_not_recorded(self, project):
+    def test_an_inexact_counter_is_still_recorded(self, project):
+        # tiktoken, the default, is not exact. Gating history on exactness would leave a
+        # typical repository with a permanently empty trend.
         work, remote = project
-        collect(work)  # left as offline / inexact
+        collect(work)
         assert run_cli(["record", "--head", "head.json"], cwd=work) == EXIT_OK
-        assert git("branch", "-r", cwd=remote) == "" or "token-report-data" not in git(
-            "for-each-ref", "--format=%(refname)", cwd=remote
+        history = History.loads(
+            git("show", "token-report-data:history.json", cwd=remote)
         )
+        assert history.entries[0].counter == "heuristic"
 
-    def test_an_approximate_run_still_renders_a_dashboard(self, project):
-        # A keyless run (a fork PR, or a repo with no secret) must still produce a
-        # usable artifact rather than an empty upload.
+    def test_record_also_writes_the_dashboard_to_a_directory(self, project):
         work, _ = project
-        collect(work)  # offline / inexact
+        collect(work)
         assert (
             run_cli(["record", "--head", "head.json", "--output-dir", "site"], cwd=work)
             == EXIT_OK
@@ -222,7 +219,7 @@ class TestRecordAndBaseline:
 
     def test_record_does_not_touch_the_working_tree(self, project):
         work, _ = project
-        self.exact_report(work)
+        collect(work)
         (work / "scratch.txt").write_text("uncommitted work\n")
         run_cli(["record", "--head", "head.json"], cwd=work)
         assert (work / "scratch.txt").read_text() == "uncommitted work\n"
@@ -230,7 +227,7 @@ class TestRecordAndBaseline:
 
     def test_baseline_reads_the_recorded_entry_for_the_merge_base(self, project):
         work, _ = project
-        self.exact_report(work)
+        collect(work)
         run_cli(["record", "--head", "head.json"], cwd=work)
         base_commit = git("rev-parse", "HEAD", cwd=work)
 
@@ -251,12 +248,12 @@ class TestRecordAndBaseline:
 
     def test_baseline_recovers_component_tiers_from_the_head_report(self, project):
         work, _ = project
-        self.exact_report(work)
+        collect(work)
         run_cli(["record", "--head", "head.json"], cwd=work)
         git("checkout", "-b", "feature", cwd=work)
         (work / "prompt.txt").write_text("You are helpful. " * 30)
         git("commit", "-am", "change", cwd=work)
-        self.exact_report(work, "head2.json")
+        collect(work, "head2.json")
 
         run_cli(
             ["baseline", "-o", "base.json", "--head", "head2.json"],
@@ -321,14 +318,9 @@ class TestReportGate:
         (work / "tokenreport.toml").write_text(
             CONFIG.format(resident_total=100000, growth=5, prompt_budget=100000)
         )
-        base = collect(work, "base.json")
-        base["counter"] = {"name": "anthropic", "exact": True}
-        (work / "base.json").write_text(json.dumps(base))
-
+        collect(work, "base.json")
         (work / "prompt.txt").write_text("You are a helpful assistant. " * 60)
-        head = collect(work, "head.json")
-        head["counter"] = {"name": "anthropic", "exact": True}
-        (work / "head.json").write_text(json.dumps(head))
+        collect(work, "head.json")
 
         assert (
             run_cli(["report", "--head", "head.json", "--base", "base.json"], cwd=work)
@@ -445,9 +437,7 @@ class TestPostingToGitHub:
 class TestDashboardCommand:
     def test_builds_a_dashboard_from_recorded_history(self, project):
         work, _ = project
-        report = collect(work)
-        report["counter"] = {"name": "anthropic", "exact": True}
-        (work / "head.json").write_text(json.dumps(report))
+        collect(work)
         run_cli(["record", "--head", "head.json"], cwd=work)
 
         assert (
@@ -479,8 +469,6 @@ class TestFullPipeline:
 
         def record_current():
             report = collect(work)
-            report["counter"] = {"name": "anthropic", "exact": True}
-            (work / "head.json").write_text(json.dumps(report))
             assert run_cli(["record", "--head", "head.json"], cwd=work) == EXIT_OK
             return report
 

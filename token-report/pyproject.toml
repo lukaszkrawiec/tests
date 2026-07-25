@@ -7,10 +7,10 @@ name = "tokenreport"
 version = "0.1.0"
 description = "CI token accounting for agent applications: measure the context your repo commits to sending"
 requires-python = ">=3.11"
-# No runtime dependencies. The Anthropic counter speaks HTTP directly so the tool
-# installs in CI without a dependency resolution step, and so it can be pointed at a
-# local fake in tests.
-dependencies = []
+# tiktoken is the default counter, so it is a real dependency. The Anthropic counter
+# needs nothing extra: it speaks HTTP directly, which keeps it pointable at a local fake
+# in tests and avoids a second SDK in the install.
+dependencies = ["tiktoken>=0.7"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pyyaml>=6"]

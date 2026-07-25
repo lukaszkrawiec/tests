@@ -1,6 +1,7 @@
 # Token Report — design document
 
-**Status:** draft for review. No code written yet.
+**Status:** built. Sections 1–4 and 6–12 describe the implementation as it stands; §5
+carries its original argument with the revised decision recorded in §5a.
 **Goal:** a coverage-report-style CI system that measures the token cost of the context a
 LangGraph application assembles — system prompts, tool schemas, knowledge-base docs — and
 reports growth per commit inside GitHub.
@@ -116,7 +117,7 @@ Two ecosystems have already solved "report a metric per commit inside GitHub":
   (uses a `header` to keep multiple comments independent).
 
 **Verdict: build the measurement, borrow the delivery.** The novel 25% is the tiered,
-composition-aware, Claude-accurate collector. The other 75% is a well-trodden path and we
+composition-aware collector. The other 75% is a well-trodden path and we
 should not reinvent it.
 
 ---
@@ -125,7 +126,7 @@ should not reinvent it.
 
 ```
 ┌─ your repo ──────────────────────────────────────────────┐
-│  tokenreport.toml         ← config: entrypoint, budgets  │
+│  tokenreport.toml     ← config: entrypoint, counter, budgets  │
 │  myapp/tokenreport.py     ← YOU write: collect()         │
 └──────────────────────────┬───────────────────────────────┘
                            │ imports & calls
@@ -134,8 +135,8 @@ should not reinvent it.
                   └────────┬────────┘
                            │ Component[]  (text or tool schemas, + tier)
                   ┌────────▼────────┐
-                  │    counter      │  Anthropic count_tokens (default)
-                  │                 │  offline fallback (fork PRs)
+                  │    counter      │  tiktoken (default) · anthropic (opt-in)
+                  │                 │  heuristic (no dependencies)
                   └────────┬────────┘
                            │
                      report.json     ← versioned, the one artifact everything reads
@@ -205,7 +206,11 @@ belongs behind an explicit `[globs]` section that forces a `tier` per pattern.
 
 ## 5. Counting
 
-**Default: Anthropic `/v1/messages/count_tokens`.** Confirmed free — "Token counting is free to
+> **Decision changed after review (see §5a).** The default counter is now `tiktoken`.
+> The analysis below still explains the marginal-counting technique and the tokenizer
+> comparability problem, both of which survive the change unaltered.
+
+**Originally proposed default: Anthropic `/v1/messages/count_tokens`.** Confirmed free — "Token counting is free to
 use but subject to requests per minute rate limits," 2,000 RPM on Start tier / 4,000 Build /
 8,000 Scale, and those limits are independent of Messages API limits. It handles system
 prompts, tools, images, and PDFs with the same input shape as Messages.
@@ -246,6 +251,27 @@ delta across a tokenizer change, printing "baseline measured on a different toke
 Drawing a 30% step change as if the prompt grew would be actively misleading.
 
 ---
+
+## 5a. Counting — decision as built
+
+`tiktoken` is the default; `anthropic` is opt-in; a dependency-free `heuristic` covers
+runners that cannot fetch a vocabulary. The reasoning that changed:
+
+- **The cost of the API was never money** — token counting is free. The cost is a
+  *provisioning dependency*: a secret that has to exist for the tool to work at all, and
+  that fork pull requests can never have. That is a worse failure mode than imprecise
+  absolute numbers.
+- **Reproducibility and accuracy are different properties, and the trend only needs the
+  first.** tiktoken gives the same answer on every machine forever. Growth measured
+  consistently is the product; matching the invoice is a separate, opt-in concern.
+- **A consequence that had to be fixed with it:** the original design refused inexact
+  counters entry into history. Making tiktoken the default under that rule would have
+  meant a typical repository never records a single point and its dashboard stays
+  permanently empty. History now records any counter and stamps its identity, and
+  *comparisons* refuse to cross a counter change — which is where the guarantee actually
+  belongs. Exactness gates nothing; identity gates everything.
+- **No auto-selection.** Silently choosing a counter based on whether a secret is present
+  would change what the numbers mean between runs.
 
 ## 6. Report schema
 

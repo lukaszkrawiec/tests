@@ -161,13 +161,11 @@ def _comparability(head: Report, base: Report) -> tuple[bool, str | None]:
     if head.counter.name != base.counter.name:
         return False, (
             f"baseline was measured with the {base.counter.name} counter and this run "
-            f"with {head.counter.name}"
+            f"with {head.counter.name}; switching counter re-bases every number"
         )
-    if not head.counter.exact or not base.counter.exact:
-        return False, (
-            "one side was measured with an approximate counter, so a delta would not "
-            "be meaningful"
-        )
+    # Exactness is deliberately not a gate here. An approximate counter still produces a
+    # meaningful delta as long as both sides used the same one — which is precisely why
+    # comparisons key on counter identity rather than on absolute accuracy.
     return True, None
 
 

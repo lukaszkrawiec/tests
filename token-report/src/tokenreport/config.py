@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+from .counters import COUNTER_NAMES, DEFAULT_COUNTER
+
 DEFAULT_MODEL = "claude-opus-5"
 CONFIG_FILENAME = "tokenreport.toml"
 
@@ -86,6 +88,8 @@ class Budgets:
 class Config:
     entrypoint: str
     model: str = DEFAULT_MODEL
+    counter: str = DEFAULT_COUNTER
+    encoding: str | None = None
     budgets: Budgets = field(default_factory=Budgets)
     history_branch: str = "token-report"
     history_path: str = "history.json"
@@ -113,9 +117,26 @@ class Config:
         if not isinstance(history, Mapping):
             raise ConfigError("[history] must be a table")
 
+        counter_raw = raw.get("counter", {}) or {}
+        if not isinstance(counter_raw, Mapping):
+            raise ConfigError(
+                "[counter] must be a table, e.g. [counter]\\nname = \"tiktoken\""
+            )
+        counter = counter_raw.get("name", DEFAULT_COUNTER)
+        if counter not in COUNTER_NAMES:
+            raise ConfigError(
+                f"counter.name must be one of {', '.join(COUNTER_NAMES)}, "
+                f"got {counter!r}"
+            )
+        encoding = counter_raw.get("encoding")
+        if encoding is not None and not isinstance(encoding, str):
+            raise ConfigError(f"counter.encoding must be a string, got {encoding!r}")
+
         return cls(
             entrypoint=entrypoint,
             model=model,
+            counter=counter,
+            encoding=encoding,
             budgets=Budgets.from_raw(budgets_raw),
             history_branch=history.get("branch", "token-report"),
             history_path=history.get("path", "history.json"),

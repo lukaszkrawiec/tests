@@ -1,41 +1,50 @@
 import pytest
 
 from tokenreport.counters import (
+    DEFAULT_COUNTER,
     AnthropicCounter,
     CounterError,
+    HeuristicCounter,
     LengthCounter,
-    OfflineCounter,
+    TiktokenCounter,
+    counter_is_exact,
     resolve,
 )
 
 from .fakes import FakeServer, count_tokens_handler
 
 
-class TestOfflineCounter:
-    def test_reports_itself_as_inexact(self):
-        # Exactness gates entry into history; an approximation must never claim it.
-        info = OfflineCounter().info
+class TestHeuristicCounter:
+    def test_names_itself_and_admits_it_is_not_exact(self):
+        # The name is what history stamps and what comparisons key on, so a counter must
+        # identify itself specifically rather than as a vague "offline".
+        info = HeuristicCounter().info
         assert info.exact is False
-        assert info.name == "offline"
+        assert info.name == "heuristic"
 
     def test_empty_text_is_zero(self):
-        assert OfflineCounter().count_text("") == 0
+        assert HeuristicCounter().count_text("") == 0
 
     def test_count_grows_with_text(self):
-        counter = OfflineCounter()
+        counter = HeuristicCounter()
         short = counter.count_text("The quick brown fox.")
         long = counter.count_text("The quick brown fox. " * 20)
         assert 0 < short < long
 
-    def test_estimate_is_in_a_plausible_range_for_prose(self):
-        # Roughly 4 characters per token is the accepted rule of thumb for English;
-        # this guards against an estimator that is wrong by an order of magnitude.
-        text = " ".join(["context engineering keeps prompts small"] * 40)
-        estimate = OfflineCounter().count_text(text)
-        assert len(text) / 8 < estimate < len(text) / 2
+    def test_estimate_tracks_tiktoken_within_a_quarter(self):
+        # Calibrated against tiktoken rather than a chars-per-token rule of thumb: this
+        # is the fallback when tiktoken is unavailable, so tiktoken is the target.
+        tiktoken = pytest.importorskip("tiktoken")
+        encoding = tiktoken.get_encoding(TiktokenCounter.DEFAULT_ENCODING)
+        text = " ".join(
+            ["Context engineering keeps prompts small and specific."] * 30
+        )
+        estimate = HeuristicCounter().count_text(text)
+        truth = len(encoding.encode(text))
+        assert 0.75 < estimate / truth < 1.25, f"{estimate} vs {truth}"
 
     def test_tools_cost_more_than_their_json(self):
-        counter = OfflineCounter()
+        counter = HeuristicCounter()
         tool = {"name": "search", "description": "Search the web.", "input_schema": {}}
         assert counter.count_tools([tool]) > counter.count_text(str(tool)) / 2
         assert counter.count_tools([tool, tool]) > counter.count_tools([tool])
@@ -152,22 +161,83 @@ class TestAnthropicCounter:
             AnthropicCounter(model="m", api_key="")
 
 
-class TestResolve:
-    def test_auto_falls_back_to_offline_without_a_key(self):
-        # This is what keeps fork pull requests working, since they get no secrets.
-        counter = resolve(model="claude-opus-5", prefer="auto", api_key="")
-        assert counter.info.name == "offline"
+class TestTiktokenCounter:
+    def test_is_the_default_counter(self):
+        assert DEFAULT_COUNTER == "tiktoken"
 
-    def test_auto_uses_the_api_when_a_key_is_present(self):
-        counter = resolve(model="claude-opus-5", prefer="auto", api_key="k")
-        assert counter.info.name == "anthropic"
+    def test_names_itself_and_admits_it_is_not_claude(self):
+        pytest.importorskip("tiktoken")
+        info = TiktokenCounter().info
+        assert info.name == "tiktoken"
+        # Reproducible is not the same as correct, and the report must not imply it is.
+        assert info.exact is False
+        assert "not Claude" in info.detail
+
+    def test_records_the_encoding_it_used(self):
+        pytest.importorskip("tiktoken")
+        assert TiktokenCounter().encoding_name == "o200k_base"
+        assert TiktokenCounter(encoding="cl100k_base").encoding_name == "cl100k_base"
+
+    def test_the_requested_encoding_is_the_one_actually_used(self):
+        # Guards against silently falling back to the default, which would make the
+        # configured encoding a lie and put mislabelled numbers into history.
+        tiktoken = pytest.importorskip("tiktoken")
+        text = "Progressive disclosure keeps the resident index small. 12345 — ok!"
+        for name in ("o200k_base", "cl100k_base", "p50k_base"):
+            expected = len(tiktoken.get_encoding(name).encode(text))
+            assert TiktokenCounter(encoding=name).count_text(text) == expected, name
+
+    def test_an_unknown_encoding_is_reported_clearly(self):
+        pytest.importorskip("tiktoken")
+        with pytest.raises(CounterError, match="could not load tiktoken encoding"):
+            TiktokenCounter(encoding="not_a_real_encoding")
+
+    def test_text_containing_a_special_token_is_counted_not_rejected(self):
+        # A prompt discussing "<|endoftext|>" is data; tiktoken raises on it by default.
+        pytest.importorskip("tiktoken")
+        assert TiktokenCounter().count_text("the <|endoftext|> marker") > 0
+
+    def test_empty_text_is_zero(self):
+        pytest.importorskip("tiktoken")
+        assert TiktokenCounter().count_text("") == 0
+
+
+class TestCounterExactness:
+    def test_only_the_provider_endpoint_is_exact(self):
+        assert counter_is_exact("anthropic") is True
+        assert counter_is_exact("tiktoken") is False
+        assert counter_is_exact("heuristic") is False
+
+    def test_an_unknown_counter_is_not_assumed_exact(self):
+        assert counter_is_exact("something-new") is False
+
+
+class TestResolve:
+    def test_defaults_to_tiktoken_with_no_key_present(self):
+        # No key, no network at measurement time, and it works on fork pull requests.
+        counter = resolve(model="claude-opus-5", api_key="")
+        assert counter.info.name in {"tiktoken", "heuristic"}
+
+    def test_a_present_key_does_not_silently_change_the_counter(self):
+        # Switching counter on the presence of a secret would change what the numbers
+        # mean between runs, and a trend whose tokenizer varies invisibly is worse than
+        # no trend at all.
+        assert resolve(model="m", api_key="k").info.name != "anthropic"
+
+    def test_anthropic_is_opt_in_by_name(self):
+        assert resolve(model="m", prefer="anthropic", api_key="k").info.name == "anthropic"
 
     def test_explicit_anthropic_without_a_key_is_an_error(self):
         with pytest.raises(CounterError, match="ANTHROPIC_API_KEY is not set"):
             resolve(model="m", prefer="anthropic", api_key="")
 
-    def test_explicit_offline_ignores_a_present_key(self):
-        assert resolve(model="m", prefer="offline", api_key="k").info.name == "offline"
+    def test_heuristic_can_be_selected_explicitly(self):
+        assert resolve(model="m", prefer="heuristic").info.name == "heuristic"
+
+    def test_the_encoding_is_passed_through(self):
+        pytest.importorskip("tiktoken")
+        counter = resolve(model="m", prefer="tiktoken", encoding="cl100k_base")
+        assert counter.encoding_name == "cl100k_base"
 
     def test_unknown_counter_name_is_an_error(self):
         with pytest.raises(CounterError, match="unknown counter 'magic'"):

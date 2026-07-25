@@ -1,20 +1,28 @@
 # Token Report measures its own example application, so CI exercises the real path.
 entrypoint = "examples.langgraph_app.tokenreport:collect"
+# Recorded alongside every count, and used by the anthropic counter. A change here
+# invalidates comparison against earlier history rather than showing up as growth.
 model = "claude-opus-5"
+
+[counter]
+# tiktoken needs no key and works on fork pull requests. Not Claude's tokenizer, so the
+# trend is the signal; switch to "anthropic" for counts that match what you are billed.
+name = "tiktoken"
+encoding = "o200k_base"
 
 [budgets]
 # Resident tokens are paid on every request, so they get the tight budget.
-resident_total = 4000
+resident_total = 2100
 resident_growth_pct = 15
 
 # On-demand documents are only paid for when retrieved; the ceiling is a sanity bound,
 # not a cost control.
-on_demand_total = 20000
+on_demand_total = 5000
 
 [budgets.component]
-"knowledge.index" = 400
-"agent.researcher.system_prompt" = 1200
-"agent.analyst.system_prompt" = 1200
+"knowledge.index" = 200
+"agent.researcher.system_prompt" = 700
+"agent.analyst.system_prompt" = 700
 
 [history]
 branch = "token-report-data"

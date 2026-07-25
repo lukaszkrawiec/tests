@@ -59,6 +59,10 @@ Point config at it:
 entrypoint = "myapp.tokenreport:collect"
 model = "claude-opus-5"
 
+[counter]
+name = "tiktoken"        # or "anthropic" for exact counts, or "heuristic" for no deps
+encoding = "o200k_base"
+
 [budgets]
 resident_total = 20000        # absolute ceiling
 resident_growth_pct = 10      # fail if resident grows more than 10% vs the base
@@ -73,7 +77,8 @@ branch = "token-report-data"
 Both a ceiling and a growth rate are worth setting: growth-only lets a prompt creep to
 50k in 9% steps, ceiling-only gives no signal until the day it hard-fails.
 
-Then copy `.github/workflows/token-report.yml` and add an `ANTHROPIC_API_KEY` secret.
+Then copy `.github/workflows/token-report.yml`. No secrets are required with the default
+counter; add an `ANTHROPIC_API_KEY` secret only if you switch to `anthropic`.
 
 ## Commands
 
@@ -90,22 +95,40 @@ reproduces locally with the same command.
 
 ## Counting
 
-Counts come from Anthropic's `/v1/messages/count_tokens`, which is **free** (subject to
-its own rate limits, independent of your Messages API limits). Two details matter:
+Three counters, selected in config. The default needs no credentials.
+
+| `[counter] name` | Accuracy | Needs |
+|---|---|---|
+| `tiktoken` *(default)* | Not Claude's tokenizer — reproducible, not exact | Vocabulary fetched once, then cached |
+| `heuristic` | Least accurate; tracks tiktoken within ~25% | Nothing at all |
+| `anthropic` | Exact — matches what you are billed | `ANTHROPIC_API_KEY` |
+
+**Why tiktoken is the default.** No key to provision, nothing on the network at
+measurement time once the vocabulary is cached, the same numbers on every machine, and it
+works on pull requests from forks — which receive no repository secrets, so an API-only
+counter simply fails for outside contributors.
+
+**What you give up.** tiktoken has no Claude vocabulary, and Claude 4.7 and later tokenize
+roughly 30% higher than earlier models for identical text. So absolute figures are
+indicative, and **the delta is the signal**. If you want numbers that match your bill —
+for setting an absolute `resident_total` you can defend, say — switch to `anthropic`;
+its token counting endpoint is free, subject only to its own rate limits, independent of
+your Messages API limits.
+
+There is deliberately **no automatic switching** between counters. Choosing one based on
+whether a secret happens to be present would change what the numbers mean from run to
+run, and a trend whose tokenizer varies invisibly is worse than no trend.
+
+Two further details:
 
 - **Counts are marginal.** Each component is measured against a cached baseline request,
   because counting one in isolation would include fixed per-request overhead and inflate
   every number. Per-tool figures are attribution; the residual cost of having tools
   enabled at all is reported separately as `tool_set_overhead` so the totals reconcile.
-- **The model is part of the measurement.** Claude 4.7 and later tokenize roughly 30%
-  higher than earlier models for identical text. Every report and history entry records
-  its model, the dashboard breaks its line at a change rather than drawing a 30% step as
-  a regression, and the comparator refuses to print a delta across one.
-
-Without an `ANTHROPIC_API_KEY` — which is every fork pull request, since those get no
-secrets — the counter falls back to an offline approximation. Those runs are labelled
-approximate and **refused entry into history**, so a trend never mixes measured and
-estimated points.
+- **The tokenizer is part of the measurement.** Every report and history entry stamps its
+  model *and* its counter. Change either and the numbers re-base: the comparator refuses
+  to print a delta across the change, and the dashboard breaks its line there rather than
+  drawing a measurement change as growth.
 
 ## What you see
 
@@ -136,8 +159,9 @@ hand-rolled versions of this.
 
 ## Limits
 
-- Absolute count accuracy is only as good as the API; the offline fallback is for
-  relative signal, not for budgeting.
+- Under the default `tiktoken` counter, absolute figures are not Claude's counts. Trend
+  and delta are sound; an absolute `resident_total` budget is only as meaningful as the
+  counter behind it, so set one against `anthropic` if it needs to be defensible.
 - `count_tokens` does not apply caching logic, so `cache_prefix` is our bookkeeping of
   what you declared, not something the API confirms.
 - The dashboard uses SVG `<title>` tooltips rather than a scripted crosshair, to stay

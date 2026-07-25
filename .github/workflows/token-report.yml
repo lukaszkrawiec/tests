@@ -72,11 +72,18 @@ jobs:
       - name: Install
         run: pip install -e .
 
+      - name: Cache the tiktoken vocabulary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tokenreport-tiktoken
+          key: tiktoken-${{ hashFiles('token-report/tokenreport.toml') }}
+
       - name: Measure this commit
         run: tokenreport collect -o head.json
         env:
-          # Absent on fork pull requests, which get no secrets. The counter falls back
-          # to an offline approximation and the report says so rather than failing.
+          TIKTOKEN_CACHE_DIR: ~/.cache/tokenreport-tiktoken
+          # Only needed when the config selects the 'anthropic' counter. The default,
+          # tiktoken, needs no secret, which is what makes fork pull requests work.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
       - name: Resolve the baseline
@@ -120,9 +127,16 @@ jobs:
       - name: Install
         run: pip install -e .
 
+      - name: Cache the tiktoken vocabulary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tokenreport-tiktoken
+          key: tiktoken-${{ hashFiles('token-report/tokenreport.toml') }}
+
       - name: Measure this commit
         run: tokenreport collect -o head.json
         env:
+          TIKTOKEN_CACHE_DIR: ~/.cache/tokenreport-tiktoken
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
       - name: Append to history and rebuild the dashboard
