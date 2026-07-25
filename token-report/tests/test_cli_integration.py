@@ -209,6 +209,17 @@ class TestRecordAndBaseline:
             "for-each-ref", "--format=%(refname)", cwd=remote
         )
 
+    def test_an_approximate_run_still_renders_a_dashboard(self, project):
+        # A keyless run (a fork PR, or a repo with no secret) must still produce a
+        # usable artifact rather than an empty upload.
+        work, _ = project
+        collect(work)  # offline / inexact
+        assert (
+            run_cli(["record", "--head", "head.json", "--output-dir", "site"], cwd=work)
+            == EXIT_OK
+        )
+        assert "<!doctype html>" in (work / "site" / "index.html").read_text()
+
     def test_record_does_not_touch_the_working_tree(self, project):
         work, _ = project
         self.exact_report(work)

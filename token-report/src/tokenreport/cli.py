@@ -223,16 +223,38 @@ def cmd_record(args: argparse.Namespace) -> int:
     context = WorkflowContext.from_env()
     head = _read_report(Path(args.head))
 
-    if not head.counter.exact:
-        print(
-            f"not recording: counter {head.counter.name!r} is approximate, and a trend "
-            f"series must not mix measured and estimated points",
-            file=sys.stderr,
-        )
-        return EXIT_OK
-
     git = Git(root=config.root)
     rendered: dict[str, str] = {}
+
+    if not head.counter.exact:
+        # Refusing to append is right — a trend series must not mix measured and
+        # estimated points. Refusing to *render* is not: the dashboard still shows the
+        # existing history, so a keyless run produces a usable artifact.
+        print(
+            f"not appending to history: counter {head.counter.name!r} is approximate",
+            file=sys.stderr,
+        )
+        if args.output_dir and not args.no_dashboard:
+            existing = None
+            if git.fetch(
+                f"{config.history_branch}:refs/remotes/origin/{config.history_branch}"
+            ):
+                existing = git.show(
+                    f"refs/remotes/origin/{config.history_branch}", config.history_path
+                )
+            history = History.loads(existing) if existing else History()
+            files = {
+                "index.html": render_dashboard(history, head, repo=context.repo),
+                ".nojekyll": "",
+            }
+            if existing:
+                files[config.history_path] = existing
+            _write_dir(Path(args.output_dir), files)
+            print(
+                f"rendered the dashboard from {len(history.entries)} recorded entries",
+                file=sys.stderr,
+            )
+        return EXIT_OK
 
     def build(parent: str | None) -> dict[str, str]:
         existing = git.show(parent, config.history_path) if parent else None

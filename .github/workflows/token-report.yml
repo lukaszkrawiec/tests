@@ -1,0 +1,142 @@
+name: Token Report
+
+# Two postures, following the continuous-benchmark pattern:
+#   pull_request  — measure, compare against the merge-base, report, gate. No writes.
+#   push to main  — measure, append to the history branch, rebuild the dashboard.
+# History is only written from the default branch, because a pull request measures code
+# that may never land.
+
+on:
+  pull_request:
+    paths:
+      - 'token-report/**'
+      - '.github/workflows/token-report.yml'
+  push:
+    branches: [master, main]
+    paths:
+      - 'token-report/**'
+      - '.github/workflows/token-report.yml'
+  workflow_dispatch:
+    inputs:
+      write_history:
+        description: >-
+          Append this run to the history branch. Off by default so a manual run can
+          verify the pipeline without creating or modifying the data branch.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: token-report
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install -e '.[dev]'
+      - name: Run tests
+        run: python -m pytest -q
+        env:
+          # The suite creates git repositories; commit-tree needs an identity.
+          GIT_AUTHOR_NAME: token-report
+          GIT_AUTHOR_EMAIL: token-report@users.noreply.github.com
+          GIT_COMMITTER_NAME: token-report
+          GIT_COMMITTER_EMAIL: token-report@users.noreply.github.com
+
+  report:
+    name: Report
+    if: github.event_name == 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # sticky comment
+      checks: write          # check run + inline annotations
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The comparison needs the merge-base, which a shallow clone does not contain.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install -e .
+
+      - name: Measure this commit
+        run: tokenreport collect -o head.json
+        env:
+          # Absent on fork pull requests, which get no secrets. The counter falls back
+          # to an offline approximation and the report says so rather than failing.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Resolve the baseline
+        run: tokenreport baseline -o base.json --head head.json
+
+      - name: Report and gate on budgets
+        run: tokenreport report --head head.json --base base.json --post --check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: token-report-pr
+          path: |
+            token-report/head.json
+            token-report/base.json
+          if-no-files-found: warn
+
+  record:
+    name: Record history
+    if: github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # append to the history branch
+    # Two merges landing seconds apart would otherwise both read the same history and
+    # one would lose its data point. The push path retries on rejection as well; this
+    # keeps the common case from contending at all.
+    concurrency:
+      group: token-report-history
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install -e .
+
+      - name: Measure this commit
+        run: tokenreport collect -o head.json
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Append to history and rebuild the dashboard
+        run: >-
+          tokenreport record --head head.json --output-dir site
+          ${{ (github.event_name == 'workflow_dispatch' && inputs.write_history != true)
+              && '--dry-run' || '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload the dashboard
+        # Works before GitHub Pages is enabled: download the artifact and open index.html.
+        uses: actions/upload-artifact@v4
+        with:
+          name: token-report-dashboard
+          path: token-report/site
+          if-no-files-found: warn
