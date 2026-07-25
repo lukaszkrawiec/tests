@@ -17,4 +17,4 @@ token-report/**/__pycache__/
 token-report/**/*.pyc
 token-report/.pytest_cache/
 token-report/build/
-token-report/*.egg-info/
+token-report/**/*.egg-info/
