@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import tomllib
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from .counters import COUNTER_NAMES, DEFAULT_COUNTER
@@ -138,12 +138,47 @@ class Config:
             counter=counter,
             encoding=encoding,
             budgets=Budgets.from_raw(budgets_raw),
-            history_branch=history.get("branch", "token-report"),
-            history_path=history.get("path", "history.json"),
-            retention_days=int(history.get("retention_days", 90)),
-            retention_max_entries=int(history.get("max_entries", 500)),
+            history_branch=_history_string(history, "branch", "token-report"),
+            history_path=_history_relative_path(history),
+            # Both must be positive. Zero max_entries used to be accepted and then
+            # silently deleted the entire recorded trend on the next run; a negative
+            # retention window collapsed all recent detail to weekly points.
+            retention_days=_history_positive_int(history, "retention_days", 90),
+            retention_max_entries=_history_positive_int(history, "max_entries", 500),
             root=root,
         )
+
+
+def _history_string(history: Mapping[str, Any], key: str, default: str) -> str:
+    value = history.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"history.{key} must be a non-empty string, got {value!r}")
+    return value
+
+
+def _history_positive_int(history: Mapping[str, Any], key: str, default: int) -> int:
+    value = history.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigError(
+            f"history.{key} must be a positive integer, got {value!r}"
+        )
+    return value
+
+
+def _history_relative_path(history: Mapping[str, Any]) -> str:
+    """Validate the history filename.
+
+    It becomes a path inside a git tree, so an absolute path or one containing '..'
+    cannot be represented and would fail deep inside git plumbing with an opaque error.
+    """
+    value = _history_string(history, "path", "history.json")
+    pure = PurePosixPath(value)
+    if pure.is_absolute() or ".." in pure.parts:
+        raise ConfigError(
+            f"history.path must be a relative path inside the data branch with no '..' "
+            f"segments, got {value!r}"
+        )
+    return value
 
 
 def find_config(start: Path | None = None) -> Path:

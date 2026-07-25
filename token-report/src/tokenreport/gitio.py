@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -156,6 +157,7 @@ def push_files(
     message: str,
     author: tuple[str, str] = ("token-report", "token-report@users.noreply.github.com"),
     max_attempts: int = 5,
+    sleep=time.sleep,
 ) -> PushResult:
     """Append a commit to ``branch``, re-deriving content if the remote moved.
 
@@ -167,7 +169,15 @@ def push_files(
     """
     last_error: str | None = None
     for attempt in range(1, max_attempts + 1):
-        exists = git.fetch(f"{branch}:refs/remotes/{git.remote}/{branch}")
+        if attempt > 1:
+            # Back off before re-reading. Retrying instantly means all attempts can be
+            # spent inside the window the other job is still holding, so the loser of a
+            # real race exhausts its retries and fails rather than appending.
+            sleep(min(2 ** (attempt - 2), 8))
+        # Forced, because this is a remote-tracking ref: if the branch was rewritten
+        # (history pruned by hand, say) an unforced fetch fails, the branch looks absent,
+        # and we would try to create one that already exists.
+        exists = git.fetch(f"+{branch}:refs/remotes/{git.remote}/{branch}")
         parent = git.rev_parse(f"refs/remotes/{git.remote}/{branch}") if exists else None
 
         files = build(parent)
@@ -210,7 +220,7 @@ def resolve_baseline_ref(git: Git, *, base_ref: str | None, head: str = "HEAD") 
             continue
         base = git.merge_base(candidate, head)
         return base or candidate
-    if git.fetch(f"{base_ref}:refs/remotes/{git.remote}/{base_ref}"):
+    if git.fetch(f"+{base_ref}:refs/remotes/{git.remote}/{base_ref}"):
         candidate = f"refs/remotes/{git.remote}/{base_ref}"
         return git.merge_base(candidate, head) or candidate
     return None

@@ -221,7 +221,8 @@ def render_comment(
         body_parts.append(f"### Changed components ({len(changed)})")
         body_parts.append("")
         shown, hidden = _fit(changed, room, show_delta=show_delta)
-        body_parts.extend(_component_table(shown, show_delta=show_delta))
+        if shown:
+            body_parts.extend(_component_table(shown, show_delta=show_delta))
         if hidden:
             body_parts.append("")
             body_parts.append(

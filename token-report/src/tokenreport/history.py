@@ -240,6 +240,14 @@ class History:
         Without this the file grows without bound: slow to fetch on every run, and a
         chart too dense to read.
         """
+        if max_entries <= 0 or retention_days <= 0:
+            # Config validates these, but prune is reachable directly and the old
+            # behaviour for max_entries=0 was to return an empty history — silently
+            # deleting the whole series. Failing loudly is the safer default.
+            raise HistoryError(
+                f"prune needs positive bounds; got retention_days={retention_days!r}, "
+                f"max_entries={max_entries!r}"
+            )
         entries = self.sorted_entries()
         if not entries:
             return History(entries=[], schema_version=self.schema_version)

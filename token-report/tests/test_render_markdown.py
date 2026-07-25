@@ -189,6 +189,14 @@ class TestCommentTruncation:
         assert "<details><summary>Unchanged" not in body
         assert len(body) <= COMMENT_LIMIT
 
+    def test_no_empty_table_is_emitted_when_no_row_fits(self):
+        # A component id can be long enough that even one row exceeds the budget. The
+        # renderer used to emit a header and divider with no rows under it.
+        head = report({"x" * 70_000: 10})
+        body = rendered(head)
+        assert "| Component |" not in body
+        assert "more changed component" in body
+
     @pytest.mark.parametrize("count", [1, 2, 50])
     def test_small_reports_are_not_truncated(self, count):
         body = rendered(self.big_report(count), self.big_report(count, tokens=50))

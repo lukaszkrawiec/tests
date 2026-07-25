@@ -199,6 +199,67 @@ class TestConcurrentAppend:
         history = read_history(remote, "data")
         assert {e.commit for e in history.entries} == {"base", "A", "B"}
 
+    def test_retries_back_off_instead_of_hammering_the_remote(self, seeded, clone):
+        # Without a delay every attempt can be spent inside the window the other job is
+        # still holding, so a real race exhausts its retries rather than appending.
+        first, second = seeded, clone()
+        git_a, git_b = Git(root=first), Git(root=second)
+        push_files(git_a, branch="data",
+                   build=lambda p: {"history.json": History(entries=[entry("base", 1)]).dumps()},
+                   message="base")
+        delays: list[float] = []
+        calls = {"n": 0}
+
+        def build_for_a(parent):
+            text = git_a.show(parent, "history.json") if parent else None
+            history = History.loads(text)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                push_files(
+                    git_b, branch="data",
+                    build=lambda pb: {
+                        "history.json": History.loads(
+                            git_b.show(pb, "history.json") if pb else None
+                        ).append(entry("B", 20)).dumps()
+                    },
+                    message="from B", sleep=delays.append,
+                )
+            return {"history.json": history.append(entry("A", 10)).dumps()}
+
+        push_files(git_a, branch="data", build=build_for_a, message="from A",
+                   sleep=delays.append)
+        assert delays, "expected a backoff delay before the retry"
+        assert all(d > 0 for d in delays)
+
+    def test_a_rewritten_history_branch_is_still_found(self, seeded, remote):
+        # An unforced fetch fails after the branch is rewritten, which used to make the
+        # branch look absent so the tool tried to create one that already existed.
+        git = Git(root=seeded)
+        push_files(git, branch="data",
+                   build=lambda p: {"history.json": History(entries=[entry("one", 2)]).dumps()},
+                   message="1")
+        push_files(git, branch="data",
+                   build=lambda p: {"history.json": History(entries=[entry("two", 1)]).dumps()},
+                   message="2")
+        # Rewrite the remote branch so local tracking is no longer an ancestor.
+        rewritten = run("commit-tree", run("rev-parse", "data^{tree}", cwd=remote),
+                        "-m", "rewritten", cwd=remote)
+        run("update-ref", "refs/heads/data", rewritten, cwd=remote)
+
+        result = push_files(
+            git, branch="data",
+            build=lambda parent: {
+                "history.json": History.loads(
+                    git.show(parent, "history.json") if parent else None
+                ).append(entry("three", 0)).dumps()
+            },
+            message="3", sleep=lambda _: None,
+        )
+        assert result.committed
+        history = read_history(remote, "data")
+        # Built on the rewritten tip rather than starting a fresh root commit.
+        assert {e.commit for e in history.entries} == {"two", "three"}
+
     def test_gives_up_with_a_clear_error_after_repeated_rejection(self, seeded, clone):
         first, second = seeded, clone()
         git_a, git_b = Git(root=first), Git(root=second)
@@ -226,6 +287,7 @@ class TestConcurrentAppend:
                 build=always_contended,
                 message="from A",
                 max_attempts=3,
+                sleep=lambda _: None,
             )
 
 
